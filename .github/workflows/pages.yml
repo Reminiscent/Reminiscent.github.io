@@ -26,7 +26,7 @@ jobs:
       - name: Stage static site
         run: |
           mkdir -p _site
-          cp -R index.html index.en.html data patches _site/
+          cp -R index.html index.zh.html data patches _site/
 
       - uses: actions/configure-pages@v5
 

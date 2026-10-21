@@ -5,8 +5,8 @@ charts and the algorithm animation are inlined, with no external requests.
 
 ## Published site
 
-https://reminiscent.github.io/ (Chinese) and
-https://reminiscent.github.io/index.en.html (English).
+https://reminiscent.github.io/ (English, default) and
+https://reminiscent.github.io/index.zh.html (Chinese).
 
 The site is plain static HTML, so the only build step is copying the files to
 the Pages artifact. Push to `main`; `.github/workflows/pages.yml` deploys it.
@@ -22,7 +22,8 @@ then open http://localhost:8000/.
 
 | Path | What it is |
 | --- | --- |
-| `index.html` | The article (Chinese), with interactive charts and the algorithm animation |
+| `index.html` | The article (English, default), with interactive charts and the algorithm animation |
+| `index.zh.html` | The Chinese version of the same article |
 | `data/*.csv` | Per-query numbers behind the sections 1, 3, 5 and 8 charts (one selected measurement per query/method); the plan-level statistics in section 4 are inlined in `index.html` |
 | `patches/` | The 5-commit PostgreSQL patch series used for all measurements (`git am`) |
 
