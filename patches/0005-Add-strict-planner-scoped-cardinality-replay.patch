@@ -1,0 +1,706 @@
+From 27f98bba97f6590251920cecd14fd5331d10cd0c Mon Sep 17 00:00:00 2001
+From: Synthetic Benchmark Review <review@example.invalid>
+Date: Sat, 17 Oct 2026 14:53:05 +0800
+Subject: [PATCH 5/7] Add strict planner-scoped cardinality replay
+
+Read precomputed subset cardinalities under the caller's permissions
+and keep the validated cache within one planner invocation. Reject
+missing, malformed, duplicate, or non-finite inputs and unsupported
+query scopes instead of mixing replay with native estimates.
+
+Invalidate cached plans when the replay key changes and record the
+cache relation dependency. Preserve native join-pair costing and
+cover fresh planning, key changes, aliases, errors, and role changes.
+
+Handle a rollout completion that already consists of a single clump,
+as exercised by the two-table replay integration case.
+---
+ src/backend/optimizer/path/costsize.c     |   3 +
+ src/backend/optimizer/path/goo.c          |   3 +-
+ src/backend/optimizer/util/Makefile       |   1 +
+ src/backend/optimizer/util/meson.build    |   1 +
+ src/backend/optimizer/util/realcard.c     | 258 ++++++++++++++++++++++
+ src/backend/utils/misc/guc_parameters.dat |   8 +
+ src/backend/utils/misc/guc_tables.c       |   1 +
+ src/include/optimizer/realcard.h          |  11 +
+ src/test/regress/expected/join_search.out |   6 +
+ src/test/regress/expected/realcard.out    | 158 +++++++++++++
+ src/test/regress/parallel_schedule        |   2 +-
+ src/test/regress/sql/join_search.sql      |   1 +
+ src/test/regress/sql/realcard.sql         |  77 +++++++
+ 13 files changed, 528 insertions(+), 2 deletions(-)
+ create mode 100644 src/backend/optimizer/util/realcard.c
+ create mode 100644 src/include/optimizer/realcard.h
+ create mode 100644 src/test/regress/expected/realcard.out
+ create mode 100644 src/test/regress/sql/realcard.sql
+
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 7bbddb8bee4..c101202a26f 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -103,6 +103,7 @@
+ #include "optimizer/paths.h"
+ #include "optimizer/placeholder.h"
+ #include "optimizer/plancat.h"
++#include "optimizer/realcard.h"
+ #include "optimizer/restrictinfo.h"
+ #include "parser/parsetree.h"
+ #include "utils/lsyscache.h"
+@@ -5619,6 +5620,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+ 							   NULL);
+ 
+ 	rel->rows = clamp_row_est(nrows);
++	rel->rows = realcard_baserel_rows(root, rel, rel->rows);
+ 
+ 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
+ 
+@@ -5697,6 +5699,7 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+ 										   inner_rel->rows,
+ 										   sjinfo,
+ 										   restrictlist);
++	rel->rows = realcard_joinrel_rows(root, rel, rel->rows);
+ }
+ 
+ /*
+diff --git a/src/backend/optimizer/path/goo.c b/src/backend/optimizer/path/goo.c
+index 00c696f7419..7f9afbafd3b 100644
+--- a/src/backend/optimizer/path/goo.c
++++ b/src/backend/optimizer/path/goo.c
+@@ -595,7 +595,8 @@ goo_run_strategy(PlannerInfo *root, List *initial_rels,
+ static RelOptInfo *
+ goo_search_internal(GooState *state)
+ {
+-	RelOptInfo *final_rel = NULL;
++	RelOptInfo *final_rel = list_length(state->clumps) == 1 ?
++		linitial(state->clumps) : NULL;
+ 	MemoryContext oldcxt;
+ 
+ 	/*
+diff --git a/src/backend/optimizer/util/Makefile b/src/backend/optimizer/util/Makefile
+index 87b4c3c0869..0cab3101cac 100644
+--- a/src/backend/optimizer/util/Makefile
++++ b/src/backend/optimizer/util/Makefile
+@@ -24,6 +24,7 @@ OBJS = \
+ 	placeholder.o \
+ 	plancat.o \
+ 	predtest.o \
++	realcard.o \
+ 	relnode.o \
+ 	restrictinfo.o \
+ 	tlist.o \
+diff --git a/src/backend/optimizer/util/meson.build b/src/backend/optimizer/util/meson.build
+index c50bcc4f74c..bdc76aa37cc 100644
+--- a/src/backend/optimizer/util/meson.build
++++ b/src/backend/optimizer/util/meson.build
+@@ -12,6 +12,7 @@ backend_sources += files(
+   'placeholder.c',
+   'plancat.c',
+   'predtest.c',
++  'realcard.c',
+   'relnode.c',
+   'restrictinfo.c',
+   'tlist.c',
+diff --git a/src/backend/optimizer/util/realcard.c b/src/backend/optimizer/util/realcard.c
+new file mode 100644
+index 00000000000..1a80374db9b
+--- /dev/null
++++ b/src/backend/optimizer/util/realcard.c
+@@ -0,0 +1,258 @@
++#include "postgres.h"
++
++#include <math.h>
++
++#include "catalog/pg_class.h"
++#include "catalog/namespace.h"
++#include "executor/spi.h"
++#include "lib/stringinfo.h"
++#include "miscadmin.h"
++#include "nodes/nodeFuncs.h"
++#include "optimizer/cost.h"
++#include "optimizer/extendplan.h"
++#include "optimizer/optimizer.h"
++#include "optimizer/realcard.h"
++#include "utils/builtins.h"
++#include "utils/hsearch.h"
++#include "utils/memutils.h"
++#include "utils/lsyscache.h"
++#include "utils/plancache.h"
++
++#define REALCARD_KEY_MAXLEN 256
++
++char	   *realcard_query_key = NULL;
++
++typedef struct RealCardEntry
++{
++	char		relids[REALCARD_KEY_MAXLEN];
++	double		rows;
++} RealCardEntry;
++
++typedef struct RealCardCache
++{
++	HTAB	   *entries;
++	char	   *query_key;
++	Oid			user_id;
++} RealCardCache;
++
++static bool realcard_loading;
++static int	realcard_extension_id = -1;
++
++void
++assign_realcard_query_key(const char *newval, void *extra)
++{
++	if (realcard_query_key != NULL && strcmp(realcard_query_key, newval) != 0)
++		ResetPlanCache();
++}
++
++static bool
++realcard_has_param(Node *node, void *context)
++{
++	if (node == NULL)
++		return false;
++	if (IsA(node, Param))
++		return true;
++	return expression_tree_walker(node, realcard_has_param, context);
++}
++
++static void
++realcard_check_scope(PlannerInfo *root)
++{
++	ListCell   *cell;
++
++	if (root->parent_root != NULL || root->parse->commandType != CMD_SELECT ||
++		root->parse->cteList != NIL || root->parse->hasSubLinks ||
++		root->parse->hasRowSecurity || root->parse->setOperations != NULL ||
++		root->hasLateralRTEs || root->join_info_list != NIL ||
++		(root->glob->boundParams != NULL && root->glob->boundParams->numParams > 0) ||
++		query_tree_walker(root->parse, realcard_has_param, NULL, 0))
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("realcard replay requires a non-parameterized top-level inner-join query")));
++	foreach(cell, root->parse->rtable)
++	{
++		RangeTblEntry *rte = lfirst_node(RangeTblEntry, cell);
++
++		if (rte->rtekind == RTE_JOIN)
++			continue;
++		if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION ||
++			rte->tablesample != NULL || rte->securityQuals != NIL)
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("realcard replay supports only ordinary tables without row security or sampling")));
++	}
++}
++
++static void
++realcard_validate_key(PlannerInfo *root, const char *key)
++{
++	const char *position = key;
++	long		previous = 0;
++
++	if (*key == '\0' || strlen(key) >= REALCARD_KEY_MAXLEN)
++		goto invalid;
++	for (;;)
++	{
++		char	   *end;
++		long		index;
++
++		if (*position < '1' || *position > '9')
++			goto invalid;
++		errno = 0;
++		index = strtol(position, &end, 10);
++		if (errno != 0 || index <= previous || index >= root->simple_rel_array_size ||
++			root->simple_rel_array[index] == NULL ||
++			root->simple_rel_array[index]->reloptkind != RELOPT_BASEREL)
++			goto invalid;
++		if (*end == '\0')
++			return;
++		if (*end != ',')
++			goto invalid;
++		previous = index;
++		position = end + 1;
++	}
++invalid:
++	ereport(ERROR,
++			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++			 errmsg("realcard: invalid relation subset key \"%s\"", key)));
++}
++
++static RealCardCache *
++realcard_load_cache(PlannerInfo *root)
++{
++	RealCardCache *cache;
++	MemoryContext oldcontext = MemoryContextSwitchTo(root->planner_cxt);
++	volatile bool connected = false;
++	Oid			argtypes[] = {TEXTOID};
++	Datum		values[] = {CStringGetTextDatum(realcard_query_key)};
++	HASHCTL		control = {0};
++
++	cache = palloc0(sizeof(RealCardCache));
++	cache->query_key = pstrdup(realcard_query_key);
++	cache->user_id = GetUserId();
++	control.keysize = REALCARD_KEY_MAXLEN;
++	control.entrysize = sizeof(RealCardEntry);
++	control.hcxt = root->planner_cxt;
++	cache->entries = hash_create("realcard planner cache", 128, &control,
++								 HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
++	realcard_loading = true;
++	PG_TRY();
++	{
++		if (SPI_connect() != SPI_OK_CONNECT)
++			elog(ERROR, "realcard: SPI_connect failed");
++		connected = true;
++		if (SPI_execute_with_args("SELECT relids, rows::float8 FROM realcard.cardinality WHERE query_key = $1",
++								  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
++			elog(ERROR, "realcard: could not read cardinalities");
++		if (SPI_gettypeid(SPI_tuptable->tupdesc, 1) != TEXTOID)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATATYPE_MISMATCH),
++					 errmsg("realcard: relation subset keys must have type text")));
++		if (SPI_processed == 0)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("realcard: no cardinalities for query key \"%s\"", cache->query_key)));
++		for (uint64 index = 0; index < SPI_processed; index++)
++		{
++			HeapTuple	tuple = SPI_tuptable->vals[index];
++			TupleDesc	descriptor = SPI_tuptable->tupdesc;
++			bool		isnull;
++			bool		found;
++			Datum		value;
++			char	   *key;
++			double		rows;
++			RealCardEntry *entry;
++
++			value = SPI_getbinval(tuple, descriptor, 1, &isnull);
++			if (isnull)
++				elog(ERROR, "realcard: null relation subset key");
++			key = TextDatumGetCString(value);
++			realcard_validate_key(root, key);
++			value = SPI_getbinval(tuple, descriptor, 2, &isnull);
++			if (isnull)
++				elog(ERROR, "realcard: null row count");
++			rows = DatumGetFloat8(value);
++			if (!isfinite(rows) || rows < 0)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("realcard: invalid row count for subset \"%s\"", key)));
++			entry = hash_search(cache->entries, key, HASH_ENTER, &found);
++			if (found)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("realcard: duplicate relation subset key \"%s\"", key)));
++			entry->rows = rows;
++			pfree(key);
++		}
++		SPI_finish();
++		connected = false;
++		realcard_loading = false;
++	}
++	PG_CATCH();
++	{
++		if (connected)
++			SPI_finish();
++		realcard_loading = false;
++		MemoryContextSwitchTo(oldcontext);
++		PG_RE_THROW();
++	}
++	PG_END_TRY();
++	SetPlannerInfoExtensionState(root, realcard_extension_id, cache);
++	root->glob->relationOids = lappend_oid(root->glob->relationOids,
++										   get_relname_relid("cardinality", get_namespace_oid("realcard", false)));
++	MemoryContextSwitchTo(oldcontext);
++	return cache;
++}
++
++static double
++realcard_lookup_rows(PlannerInfo *root, RelOptInfo *rel, double native_rows)
++{
++	RealCardCache *cache;
++	RealCardEntry *entry;
++	StringInfoData key;
++	int			member = -1;
++
++	if (realcard_loading || realcard_query_key == NULL || realcard_query_key[0] == '\0')
++		return native_rows;
++	if (realcard_extension_id < 0)
++		realcard_extension_id = GetPlannerExtensionId("realcard");
++	cache = GetPlannerInfoExtensionState(root, realcard_extension_id);
++	if (cache == NULL)
++	{
++		realcard_check_scope(root);
++		cache = realcard_load_cache(root);
++	}
++	if (strcmp(cache->query_key, realcard_query_key) != 0 || cache->user_id != GetUserId())
++		elog(ERROR, "realcard: replay key or role changed during planning");
++	if (rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("realcard replay does not support inheritance members")));
++	initStringInfo(&key);
++	while ((member = bms_next_member(rel->relids, member)) >= 0)
++		appendStringInfo(&key, "%s%d", key.len == 0 ? "" : ",", member);
++	if (key.len == 0 || key.len >= REALCARD_KEY_MAXLEN)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++				 errmsg("realcard: relation subset key exceeds the supported size")));
++	entry = hash_search(cache->entries, key.data, HASH_FIND, NULL);
++	if (entry == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("realcard: missing cardinality for query key \"%s\", subset \"%s\"",
++						cache->query_key, key.data)));
++	pfree(key.data);
++	return clamp_row_est(entry->rows);
++}
++
++double
++realcard_baserel_rows(PlannerInfo *root, RelOptInfo *rel, double native_rows)
++{
++	return realcard_lookup_rows(root, rel, native_rows);
++}
++
++double
++realcard_joinrel_rows(PlannerInfo *root, RelOptInfo *rel, double native_rows)
++{
++	return realcard_lookup_rows(root, rel, native_rows);
++}
+diff --git a/src/backend/utils/misc/guc_parameters.dat b/src/backend/utils/misc/guc_parameters.dat
+index 33e866f5d28..f42c800a215 100644
+--- a/src/backend/utils/misc/guc_parameters.dat
++++ b/src/backend/utils/misc/guc_parameters.dat
+@@ -2446,6 +2446,14 @@
+   max => 'DBL_MAX',
+ },
+ 
++{ name => 'realcard.query_key', type => 'string', context => 'PGC_USERSET', group => 'QUERY_TUNING_OTHER',
++  short_desc => 'Selects precomputed cardinalities for one flat inner-join query.',
++  flags => 'GUC_EXPLAIN',
++  variable => 'realcard_query_key',
++  boot_val => '""',
++  assign_hook => 'assign_realcard_query_key',
++},
++
+ { name => 'recovery_end_command', type => 'string', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVE_RECOVERY',
+   short_desc => 'Sets the shell command that will be executed once at the end of recovery.',
+   variable => 'recoveryEndCommand',
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 90bbf4d4998..db7721477ae 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -61,6 +61,7 @@
+ #include "optimizer/goo.h"
+ #include "optimizer/optimizer.h"
+ #include "optimizer/paths.h"
++#include "optimizer/realcard.h"
+ #include "optimizer/planmain.h"
+ #include "parser/parse_expr.h"
+ #include "parser/parser.h"
+diff --git a/src/include/optimizer/realcard.h b/src/include/optimizer/realcard.h
+new file mode 100644
+index 00000000000..a2bec5fba4b
+--- /dev/null
++++ b/src/include/optimizer/realcard.h
+@@ -0,0 +1,11 @@
++#ifndef REALCARD_H
++#define REALCARD_H
++
++#include "nodes/pathnodes.h"
++
++extern PGDLLIMPORT char *realcard_query_key;
++extern void assign_realcard_query_key(const char *newval, void *extra);
++extern double realcard_baserel_rows(PlannerInfo *root, RelOptInfo *rel, double native_rows);
++extern double realcard_joinrel_rows(PlannerInfo *root, RelOptInfo *rel, double native_rows);
++
++#endif
+diff --git a/src/test/regress/expected/join_search.out b/src/test/regress/expected/join_search.out
+index e53fa4a2867..4cfcbeea364 100644
+--- a/src/test/regress/expected/join_search.out
++++ b/src/test/regress/expected/join_search.out
+@@ -35,6 +35,12 @@ SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo
+ (1 row)
+ 
+ SET join_search_method = goo_rollout_lindp;
++SELECT count(*) FROM js_a a JOIN js_b b ON a.a = b.a;
++ count 
++-------
++     3
++(1 row)
++
+ SELECT count(*) FROM js_a, js_b, js_c;
+  count 
+ -------
+diff --git a/src/test/regress/expected/realcard.out b/src/test/regress/expected/realcard.out
+new file mode 100644
+index 00000000000..9c165db8532
+--- /dev/null
++++ b/src/test/regress/expected/realcard.out
+@@ -0,0 +1,158 @@
++CREATE SCHEMA realcard;
++CREATE TABLE realcard.cardinality (query_key text, relids text, rows numeric);
++CREATE TABLE rc_a (id integer);
++CREATE TABLE rc_b (id integer);
++INSERT INTO rc_a SELECT generate_series(1, 10);
++INSERT INTO rc_b SELECT generate_series(1, 10);
++ANALYZE rc_a;
++ANALYZE rc_b;
++INSERT INTO realcard.cardinality VALUES
++('pair', '1', 7), ('pair', '2', 11), ('pair', '1,2', 13),
++('missing', '1', 7), ('missing', '2', 11),
++('zero', '1', 0), ('bad-order', '2,1', 3),
++('bad-rows', '1', -1), ('bad-nan', '1', 'NaN'),
++('duplicate', '1', 2), ('duplicate', '1', 3),
++('null-key', NULL, 1), ('null-rows', '1', NULL);
++SET realcard.query_key = 'pair';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Hash Join  (cost=1.19..2.41 rows=13 width=8)
++   Hash Cond: (b.id = a.id)
++   ->  Seq Scan on rc_b b  (cost=0.00..1.10 rows=11 width=4)
++   ->  Hash  (cost=1.10..1.10 rows=7 width=4)
++         ->  Seq Scan on rc_a a  (cost=0.00..1.10 rows=7 width=4)
++(5 rows)
++
++SET join_search_method = goo_rollout_lindp;
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Hash Join  (cost=1.19..2.41 rows=13 width=8)
++   Hash Cond: (b.id = a.id)
++   ->  Seq Scan on rc_b b  (cost=0.00..1.10 rows=11 width=4)
++   ->  Hash  (cost=1.10..1.10 rows=7 width=4)
++         ->  Seq Scan on rc_a a  (cost=0.00..1.10 rows=7 width=4)
++(5 rows)
++
++SELECT count(*) FROM rc_a a JOIN rc_b b ON a.id = b.id;
++ count 
++-------
++    10
++(1 row)
++
++EXPLAIN SELECT * FROM rc_a a JOIN rc_a b ON a.id = b.id;
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Hash Join  (cost=1.19..2.41 rows=13 width=8)
++   Hash Cond: (b.id = a.id)
++   ->  Seq Scan on rc_a b  (cost=0.00..1.10 rows=11 width=4)
++   ->  Hash  (cost=1.10..1.10 rows=7 width=4)
++         ->  Seq Scan on rc_a a  (cost=0.00..1.10 rows=7 width=4)
++(5 rows)
++
++RESET realcard.query_key;
++UPDATE realcard.cardinality SET rows = 19 WHERE query_key = 'pair' AND relids = '1,2';
++SET realcard.query_key = 'pair';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Hash Join  (cost=1.19..2.41 rows=19 width=8)
++   Hash Cond: (b.id = a.id)
++   ->  Seq Scan on rc_b b  (cost=0.00..1.10 rows=11 width=4)
++   ->  Hash  (cost=1.10..1.10 rows=7 width=4)
++         ->  Seq Scan on rc_a a  (cost=0.00..1.10 rows=7 width=4)
++(5 rows)
++
++SET realcard.query_key = 'missing';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++ERROR:  realcard: missing cardinality for query key "missing", subset "1,2"
++SET realcard.query_key = 'pair';
++PREPARE rc_repeat AS SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++EXPLAIN EXECUTE rc_repeat;
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Hash Join  (cost=1.19..2.41 rows=19 width=8)
++   Hash Cond: (b.id = a.id)
++   ->  Seq Scan on rc_b b  (cost=0.00..1.10 rows=11 width=4)
++   ->  Hash  (cost=1.10..1.10 rows=7 width=4)
++         ->  Seq Scan on rc_a a  (cost=0.00..1.10 rows=7 width=4)
++(5 rows)
++
++SET realcard.query_key = 'missing';
++EXPLAIN EXECUTE rc_repeat;
++ERROR:  realcard: missing cardinality for query key "missing", subset "1,2"
++DEALLOCATE rc_repeat;
++SET realcard.query_key = 'unknown';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: no cardinalities for query key "unknown"
++SET realcard.query_key = 'zero';
++EXPLAIN SELECT * FROM rc_a;
++                     QUERY PLAN                     
++----------------------------------------------------
++ Seq Scan on rc_a  (cost=0.00..1.10 rows=1 width=4)
++(1 row)
++
++SET realcard.query_key = 'bad-order';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++ERROR:  realcard: invalid relation subset key "2,1"
++SET realcard.query_key = 'bad-rows';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: invalid row count for subset "1"
++SET realcard.query_key = 'bad-nan';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: invalid row count for subset "1"
++SET realcard.query_key = 'duplicate';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: duplicate relation subset key "1"
++SET realcard.query_key = 'null-key';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: null relation subset key
++SET realcard.query_key = 'null-rows';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: null row count
++SET realcard.query_key = 'pair';
++EXPLAIN SELECT * FROM rc_a a LEFT JOIN rc_b b ON a.id = b.id;
++ERROR:  realcard replay requires a non-parameterized top-level inner-join query
++PREPARE rc_param(integer) AS SELECT * FROM rc_a WHERE id = $1;
++EXPLAIN EXECUTE rc_param(1);
++ERROR:  realcard replay requires a non-parameterized top-level inner-join query
++DEALLOCATE rc_param;
++EXPLAIN SELECT * FROM (SELECT * FROM rc_a OFFSET 0) s;
++ERROR:  realcard replay requires a non-parameterized top-level inner-join query
++CREATE ROLE regress_realcard_reader;
++GRANT SELECT ON rc_a TO regress_realcard_reader;
++GRANT USAGE ON SCHEMA realcard TO regress_realcard_reader;
++SET ROLE regress_realcard_reader;
++SET realcard.query_key = 'zero';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  permission denied for table cardinality
++CONTEXT:  SQL statement "SELECT relids, rows::float8 FROM realcard.cardinality WHERE query_key = $1"
++RESET ROLE;
++EXPLAIN SELECT * FROM rc_a;
++                     QUERY PLAN                     
++----------------------------------------------------
++ Seq Scan on rc_a  (cost=0.00..1.10 rows=1 width=4)
++(1 row)
++
++RESET realcard.query_key;
++EXPLAIN SELECT * FROM rc_a;
++                     QUERY PLAN                      
++-----------------------------------------------------
++ Seq Scan on rc_a  (cost=0.00..1.10 rows=10 width=4)
++(1 row)
++
++ALTER TABLE realcard.cardinality RENAME COLUMN relids TO saved_relids;
++ALTER TABLE realcard.cardinality ADD COLUMN relids integer DEFAULT 1;
++SET realcard.query_key = 'zero';
++EXPLAIN SELECT * FROM rc_a;
++ERROR:  realcard: relation subset keys must have type text
++RESET realcard.query_key;
++ALTER TABLE realcard.cardinality DROP COLUMN relids;
++ALTER TABLE realcard.cardinality RENAME COLUMN saved_relids TO relids;
++DROP OWNED BY regress_realcard_reader;
++DROP ROLE regress_realcard_reader;
++RESET join_search_method;
++DROP TABLE rc_a, rc_b;
++DROP SCHEMA realcard CASCADE;
++NOTICE:  drop cascades to table realcard.cardinality
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 57a4df5bcc7..4899f9bc044 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -135,7 +135,7 @@ test: compression compression_lz4 compression_pglz cluster
+ # oidjoins is read-only, though, and should run late for best coverage
+ test: oidjoins event_trigger
+ 
+-test: join_search
++test: join_search realcard
+ 
+ 
+ # event_trigger_login cannot run concurrently with any other tests because
+diff --git a/src/test/regress/sql/join_search.sql b/src/test/regress/sql/join_search.sql
+index 78ba8add3ca..b354b4472e8 100644
+--- a/src/test/regress/sql/join_search.sql
++++ b/src/test/regress/sql/join_search.sql
+@@ -30,6 +30,7 @@ END;
+ $$;
+ SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout'), js_check('goo_rollout_lindp');
+ SET join_search_method = goo_rollout_lindp;
++SELECT count(*) FROM js_a a JOIN js_b b ON a.a = b.a;
+ SELECT count(*) FROM js_a, js_b, js_c;
+ SELECT count(*) FROM js_a a LEFT JOIN js_b b ON a.a = b.a
+ JOIN js_c c ON c.a = a.a;
+diff --git a/src/test/regress/sql/realcard.sql b/src/test/regress/sql/realcard.sql
+new file mode 100644
+index 00000000000..6133a1c1e1c
+--- /dev/null
++++ b/src/test/regress/sql/realcard.sql
+@@ -0,0 +1,77 @@
++CREATE SCHEMA realcard;
++CREATE TABLE realcard.cardinality (query_key text, relids text, rows numeric);
++CREATE TABLE rc_a (id integer);
++CREATE TABLE rc_b (id integer);
++INSERT INTO rc_a SELECT generate_series(1, 10);
++INSERT INTO rc_b SELECT generate_series(1, 10);
++ANALYZE rc_a;
++ANALYZE rc_b;
++INSERT INTO realcard.cardinality VALUES
++('pair', '1', 7), ('pair', '2', 11), ('pair', '1,2', 13),
++('missing', '1', 7), ('missing', '2', 11),
++('zero', '1', 0), ('bad-order', '2,1', 3),
++('bad-rows', '1', -1), ('bad-nan', '1', 'NaN'),
++('duplicate', '1', 2), ('duplicate', '1', 3),
++('null-key', NULL, 1), ('null-rows', '1', NULL);
++SET realcard.query_key = 'pair';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++SET join_search_method = goo_rollout_lindp;
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++SELECT count(*) FROM rc_a a JOIN rc_b b ON a.id = b.id;
++EXPLAIN SELECT * FROM rc_a a JOIN rc_a b ON a.id = b.id;
++RESET realcard.query_key;
++UPDATE realcard.cardinality SET rows = 19 WHERE query_key = 'pair' AND relids = '1,2';
++SET realcard.query_key = 'pair';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++SET realcard.query_key = 'missing';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++SET realcard.query_key = 'pair';
++PREPARE rc_repeat AS SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++EXPLAIN EXECUTE rc_repeat;
++SET realcard.query_key = 'missing';
++EXPLAIN EXECUTE rc_repeat;
++DEALLOCATE rc_repeat;
++SET realcard.query_key = 'unknown';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'zero';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'bad-order';
++EXPLAIN SELECT * FROM rc_a a JOIN rc_b b ON a.id = b.id;
++SET realcard.query_key = 'bad-rows';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'bad-nan';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'duplicate';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'null-key';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'null-rows';
++EXPLAIN SELECT * FROM rc_a;
++SET realcard.query_key = 'pair';
++EXPLAIN SELECT * FROM rc_a a LEFT JOIN rc_b b ON a.id = b.id;
++PREPARE rc_param(integer) AS SELECT * FROM rc_a WHERE id = $1;
++EXPLAIN EXECUTE rc_param(1);
++DEALLOCATE rc_param;
++EXPLAIN SELECT * FROM (SELECT * FROM rc_a OFFSET 0) s;
++CREATE ROLE regress_realcard_reader;
++GRANT SELECT ON rc_a TO regress_realcard_reader;
++GRANT USAGE ON SCHEMA realcard TO regress_realcard_reader;
++SET ROLE regress_realcard_reader;
++SET realcard.query_key = 'zero';
++EXPLAIN SELECT * FROM rc_a;
++RESET ROLE;
++EXPLAIN SELECT * FROM rc_a;
++RESET realcard.query_key;
++EXPLAIN SELECT * FROM rc_a;
++ALTER TABLE realcard.cardinality RENAME COLUMN relids TO saved_relids;
++ALTER TABLE realcard.cardinality ADD COLUMN relids integer DEFAULT 1;
++SET realcard.query_key = 'zero';
++EXPLAIN SELECT * FROM rc_a;
++RESET realcard.query_key;
++ALTER TABLE realcard.cardinality DROP COLUMN relids;
++ALTER TABLE realcard.cardinality RENAME COLUMN saved_relids TO relids;
++DROP OWNED BY regress_realcard_reader;
++DROP ROLE regress_realcard_reader;
++RESET join_search_method;
++DROP TABLE rc_a, rc_b;
++DROP SCHEMA realcard CASCADE;
+-- 
+2.50.1 (Apple Git-155)
+

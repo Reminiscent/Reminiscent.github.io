@@ -1,0 +1,292 @@
+From e0b19ffbe64474e80d3a5505addd09d7f8b33334 Mon Sep 17 00:00:00 2001
+From: Synthetic Benchmark Review <review@example.invalid>
+Date: Sat, 17 Oct 2026 14:46:33 +0800
+Subject: [PATCH 3/7] Add two-seed rollout with ordinary completion reuse
+
+Compare ordinary completions of the two highest-ranked legal joins
+at each decision. Reuse the first ordinary completion as a protected
+candidate instead of running a separate baseline search.
+
+Share exact input-object probe metrics within a flat inner-join
+strategy and keep other shapes uncached. Retain completed ordinary
+and rollout paths, including partial paths, for final selection.
+---
+ src/backend/optimizer/path/goo.c          | 127 +++++++++++++++++++++-
+ src/backend/utils/misc/guc_tables.c       |   1 +
+ src/include/optimizer/goo.h               |   3 +-
+ src/test/regress/expected/join_search.out |  12 +-
+ src/test/regress/sql/join_search.sql      |   4 +-
+ 5 files changed, 135 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/optimizer/path/goo.c b/src/backend/optimizer/path/goo.c
+index 5afe1a592a3..386ce5dbf62 100644
+--- a/src/backend/optimizer/path/goo.c
++++ b/src/backend/optimizer/path/goo.c
+@@ -137,7 +137,10 @@ static GooState *goo_init_state(PlannerInfo *root, List *initial_rels,
+ 								GooGreedyStrategy strategy, bool capture_order);
+ static void goo_destroy_state(GooState *state);
+ static RelOptInfo *goo_search_internal(GooState *state);
+-
++static bool goo_rollout_complete(GooState *state, GooCandidate *candidate,
++								 int *disabled_nodes, Cost *total_cost,
++								 RelOptInfo **completed_rel,
++								 List **completed_join_rel_list);
+ static void goo_reset_probe_state(GooState *state, int saved_rel_len,
+ 								  struct HTAB *saved_hash);
+ static GooCandidate *goo_build_candidate(GooState *state, RelOptInfo *left,
+@@ -187,7 +190,7 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 	GooStrategyResult *best = NULL;
+ 	RelOptInfo *result;
+ 	bool		refine = join_search_method == JOIN_SEARCH_GOO_LINDP;
+-	bool		rollout = false;
++	bool		rollout = join_search_method == JOIN_SEARCH_GOO_ROLLOUT;
+ 
+ 	Assert(levels_needed == list_length(initial_rels));
+ 	for (int index = 0; index < lengthof(strategies); index++)
+@@ -230,6 +233,22 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 		root->join_rel_hash = best->join_rel_hash;
+ 	}
+ 
++	if (rollout)
++	{
++		for (int index = 0; index < lengthof(strategies); index++)
++		{
++			if (seeds[index].ordinary_result == NULL)
++				elog(ERROR, "GOO %s rollout found no ordinary completion",
++					 goo_strategy_name(strategies[index]));
++			if (&seeds[index] != best)
++				goo_add_candidate_paths(root, result, seeds[index].result, true);
++			goo_add_candidate_paths(root, result, seeds[index].ordinary_result, true);
++		}
++		list_sort(result->pathlist, goo_path_total_cost_compare);
++		list_sort(result->partial_pathlist, goo_path_total_cost_compare);
++		set_cheapest(result);
++	}
++
+ 	return result;
+ }
+ 
+@@ -531,7 +550,17 @@ goo_run_strategy(PlannerInfo *root, List *initial_rels,
+ 	state = goo_init_state(root, initial_rels, strategy, capture_order);
+ 	state->rollout = rollout;
+ 	/* Special joins can depend on more planner state than these input paths. */
+-
++	if (rollout && (root->join_info_list == NIL && !root->hasLateralRTEs && root->placeholder_list == NIL))
++	{
++		HASHCTL		ctl = {0};
++
++		ctl.keysize = sizeof(GooProbeKey);
++		ctl.entrysize = sizeof(GooProbeEntry);
++		ctl.hcxt = state->goo_cxt;
++		state->probe_cache = hash_create("GOO rollout probes", 1024,
++										 &ctl,
++										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++	}
+ 	result.result = goo_search_internal(state);
+ 
+ 	if (result.result != NULL)
+@@ -599,6 +628,7 @@ goo_search_internal(GooState *state)
+ 	{
+ 		ListCell   *lc1;
+ 		GooCandidate *best_candidate = NULL;
++		GooCandidate *second_candidate = NULL;
+ 
+ 		/* Allow query cancellation during long join searches */
+ 		CHECK_FOR_INTERRUPTS();
+@@ -611,6 +641,7 @@ goo_search_internal(GooState *state)
+ 			MemoryContextReset(state->cand_cxt);
+ 			state->prune_cartesian = prune_cartesian;
+ 			best_candidate = NULL;
++			second_candidate = NULL;
+ 
+ 
+ 			for (lc1 = list_head(state->clumps); lc1 != NULL;
+@@ -633,8 +664,13 @@ goo_search_internal(GooState *state)
+ 						goo_candidate_better(state->strategy,
+ 											 cand, best_candidate))
+ 					{
++						second_candidate = best_candidate;
+ 						best_candidate = cand;
+ 					}
++					else if (second_candidate == NULL ||
++							 goo_candidate_better(state->strategy, cand,
++												  second_candidate))
++						second_candidate = cand;
+ 				}
+ 			}
+ 
+@@ -649,6 +685,47 @@ goo_search_internal(GooState *state)
+ 			return NULL;
+ 		}
+ 
++		if (state->rollout && second_candidate != NULL)
++		{
++			int			first_disabled;
++			int			second_disabled;
++			Cost		first_cost;
++			Cost		second_cost;
++			bool		first_ok;
++			bool		second_ok;
++			bool		first_step =
++				list_length(state->clumps) == state->initial_nrels;
++
++			first_ok = goo_rollout_complete(state, best_candidate,
++											&first_disabled, &first_cost,
++											first_step ? &state->ordinary_result : NULL,
++											first_step ? &state->ordinary_join_rel_list : NULL);
++			second_ok = goo_rollout_complete(state, second_candidate,
++											 &second_disabled, &second_cost,
++											 NULL, NULL);
++			if (!first_ok && !second_ok)
++			{
++				MemoryContextSwitchTo(oldcxt);
++				return NULL;
++			}
++			if (second_ok &&
++				(!first_ok || second_disabled < first_disabled ||
++				 (second_disabled == first_disabled &&
++				  second_cost < first_cost)))
++				best_candidate = second_candidate;
++		}
++		else if (state->rollout &&
++				 list_length(state->clumps) == state->initial_nrels)
++		{
++			int			disabled_nodes;
++			Cost		total_cost;
++
++			(void) goo_rollout_complete(state, best_candidate,
++										&disabled_nodes, &total_cost,
++										&state->ordinary_result,
++										&state->ordinary_join_rel_list);
++		}
++
+ 
+ 		final_rel = goo_commit_join(state, best_candidate);
+ 
+@@ -663,6 +740,50 @@ goo_search_internal(GooState *state)
+ }
+ 
+ /* Complete one proposed join with ordinary GOO in separate joinrel lists. */
++static bool
++goo_rollout_complete(GooState *state, GooCandidate *candidate,
++					 int *disabled_nodes, Cost *total_cost,
++					 RelOptInfo **completed_rel,
++					 List **completed_join_rel_list)
++{
++	PlannerInfo *root = state->root;
++	List	   *saved_join_rel_list = root->join_rel_list;
++	struct HTAB *saved_hash = root->join_rel_hash;
++	GooState   *branch;
++	RelOptInfo *result;
++	MemoryContext oldcxt;
++
++	oldcxt = MemoryContextSwitchTo(root->planner_cxt);
++	root->join_rel_list = list_copy(saved_join_rel_list);
++	root->join_rel_hash = NULL;
++	MemoryContextSwitchTo(oldcxt);
++
++	branch = goo_init_state(root, state->clumps, state->strategy, false);
++	branch->probe_cache = state->probe_cache;
++	oldcxt = MemoryContextSwitchTo(branch->goo_cxt);
++	(void) goo_commit_join(branch, candidate);
++	result = goo_search_internal(branch);
++	MemoryContextSwitchTo(oldcxt);
++	if (result != NULL)
++	{
++		*disabled_nodes = result->cheapest_total_path->disabled_nodes;
++		*total_cost = result->cheapest_total_path->total_cost;
++		if (completed_rel != NULL)
++		{
++			*completed_rel = result;
++			*completed_join_rel_list = root->join_rel_list;
++		}
++	}
++	goo_destroy_state(branch);
++
++	/*
++	 * Branch joinrels remain in planner_cxt, but are not visible to this
++	 * search.
++	 */
++	root->join_rel_list = saved_join_rel_list;
++	root->join_rel_hash = saved_hash;
++	return result != NULL;
++}
+ 
+ /*
+  * goo_candidate_prunable
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 8b78e46def2..ba67600a4cc 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -431,6 +431,7 @@ static const struct config_enum_entry join_search_method_options[] = {
+ 	{"geqo", JOIN_SEARCH_GEQO, false},
+ 	{"goo_combined", JOIN_SEARCH_GOO_COMBINED, false},
+ 	{"goo_lindp", JOIN_SEARCH_GOO_LINDP, false},
++	{"goo_rollout", JOIN_SEARCH_GOO_ROLLOUT, false},
+ 	{NULL, 0, false}
+ };
+ 
+diff --git a/src/include/optimizer/goo.h b/src/include/optimizer/goo.h
+index 2ae19609a0b..87c2b3cebff 100644
+--- a/src/include/optimizer/goo.h
++++ b/src/include/optimizer/goo.h
+@@ -9,7 +9,8 @@ typedef enum JoinSearchMethod
+ 	JOIN_SEARCH_DP,
+ 	JOIN_SEARCH_GEQO,
+ 	JOIN_SEARCH_GOO_COMBINED,
+-	JOIN_SEARCH_GOO_LINDP
++	JOIN_SEARCH_GOO_LINDP,
++	JOIN_SEARCH_GOO_ROLLOUT
+ } JoinSearchMethod;
+ 
+ typedef enum GooGreedyStrategy
+diff --git a/src/test/regress/expected/join_search.out b/src/test/regress/expected/join_search.out
+index 99518157440..e1e23f079a9 100644
+--- a/src/test/regress/expected/join_search.out
++++ b/src/test/regress/expected/join_search.out
+@@ -28,13 +28,13 @@ BEGIN
+     RETURN matches;
+ END;
+ $$;
+-SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp');
+- js_check | js_check | js_check | js_check 
+-----------+----------+----------+----------
+- t        | t        | t        | t
++SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout');
++ js_check | js_check | js_check | js_check | js_check 
++----------+----------+----------+----------+----------
++ t        | t        | t        | t        | t
+ (1 row)
+ 
+-SET join_search_method = goo_lindp;
++SET join_search_method = goo_rollout;
+ SELECT count(*) FROM js_a, js_b, js_c;
+  count 
+ -------
+@@ -50,7 +50,7 @@ JOIN js_c c ON c.a = a.a;
+ 
+ SET join_search_method = invalid;
+ ERROR:  invalid value for parameter "join_search_method": "invalid"
+-HINT:  Available values: auto, dp, geqo, goo_combined, goo_lindp.
++HINT:  Available values: auto, dp, geqo, goo_combined, goo_lindp, goo_rollout.
+ RESET join_search_method;
+ DROP FUNCTION js_check(text);
+ DROP TABLE js_expected, js_a, js_b, js_c;
+diff --git a/src/test/regress/sql/join_search.sql b/src/test/regress/sql/join_search.sql
+index 8b3533dcf1f..18f48048c94 100644
+--- a/src/test/regress/sql/join_search.sql
++++ b/src/test/regress/sql/join_search.sql
+@@ -28,8 +28,8 @@ BEGIN
+     RETURN matches;
+ END;
+ $$;
+-SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp');
+-SET join_search_method = goo_lindp;
++SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout');
++SET join_search_method = goo_rollout;
+ SELECT count(*) FROM js_a, js_b, js_c;
+ SELECT count(*) FROM js_a a LEFT JOIN js_b b ON a.a = b.a
+ JOIN js_c c ON c.a = a.a;
+-- 
+2.50.1 (Apple Git-155)
+

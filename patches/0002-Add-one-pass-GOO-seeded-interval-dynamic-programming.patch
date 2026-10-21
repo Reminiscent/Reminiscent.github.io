@@ -1,0 +1,520 @@
+From 52954127772b17914071ce5ac51edbae5a32827b Mon Sep 17 00:00:00 2001
+From: Synthetic Benchmark Review <review@example.invalid>
+Date: Sat, 17 Oct 2026 14:45:05 +0800
+Subject: [PATCH 2/7] Add one-pass GOO-seeded interval dynamic programming
+
+Refine the best of the two completed GOO seed orders with interval
+dynamic programming using normal join legality and path generation.
+Retain the seed's complete and partial paths and project candidates
+onto one final relation target before selecting the cheapest path.
+
+Finalize each interval level and restore temporary planner state.
+Reject an incomplete refinement instead of falling back to GOO or DP.
+---
+ src/backend/optimizer/path/Makefile       |   1 +
+ src/backend/optimizer/path/goo.c          |  84 +++++++-
+ src/backend/optimizer/path/lindp.c        | 252 ++++++++++++++++++++++
+ src/backend/optimizer/path/meson.build    |   1 +
+ src/backend/utils/misc/guc_tables.c       |   1 +
+ src/include/optimizer/goo.h               |   3 +-
+ src/include/optimizer/lindp.h             |   9 +
+ src/test/regress/expected/join_search.out |  12 +-
+ src/test/regress/sql/join_search.sql      |   4 +-
+ 9 files changed, 357 insertions(+), 10 deletions(-)
+ create mode 100644 src/backend/optimizer/path/lindp.c
+ create mode 100644 src/include/optimizer/lindp.h
+
+diff --git a/src/backend/optimizer/path/Makefile b/src/backend/optimizer/path/Makefile
+index 3bc825cd845..d4e6311788f 100644
+--- a/src/backend/optimizer/path/Makefile
++++ b/src/backend/optimizer/path/Makefile
+@@ -19,6 +19,7 @@ OBJS = \
+ 	equivclass.o \
+ 	goo.o \
+ 	indxpath.o \
++	lindp.o \
+ 	joinpath.o \
+ 	joinrels.o \
+ 	pathkeys.o \
+diff --git a/src/backend/optimizer/path/goo.c b/src/backend/optimizer/path/goo.c
+index 62a71e77fbc..5afe1a592a3 100644
+--- a/src/backend/optimizer/path/goo.c
++++ b/src/backend/optimizer/path/goo.c
+@@ -45,6 +45,7 @@
+ #include "nodes/pathnodes.h"
+ #include "optimizer/goo.h"
+ #include "optimizer/joininfo.h"
++#include "optimizer/lindp.h"
+ #include "optimizer/pathnode.h"
+ #include "optimizer/paths.h"
+ #include "utils/hsearch.h"
+@@ -153,6 +154,12 @@ static GooStrategyResult goo_run_strategy(PlannerInfo *root, List *initial_rels,
+ 										  GooGreedyStrategy strategy,
+ 										  bool capture_order, bool rollout);
+ 
++static void goo_add_candidate_paths(PlannerInfo *root, RelOptInfo *target,
++									RelOptInfo *source, bool preserve);
++static void goo_restore_seed_paths(RelOptInfo *target, List *seed_paths,
++								   List *seed_partial_paths);
++static int	goo_path_total_cost_compare(const ListCell *a, const ListCell *b);
++
+ static void goo_init_order_segments(GooState *state);
+ static GooOrderSegment *goo_find_order_segment(GooState *state,
+ 											   RelOptInfo *rel);
+@@ -179,7 +186,7 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 	GooStrategyResult seeds[lengthof(strategies)];
+ 	GooStrategyResult *best = NULL;
+ 	RelOptInfo *result;
+-	bool		refine = false;
++	bool		refine = join_search_method == JOIN_SEARCH_GOO_LINDP;
+ 	bool		rollout = false;
+ 
+ 	Assert(levels_needed == list_length(initial_rels));
+@@ -202,11 +209,86 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 	result = best->result;
+ 	root->join_rel_list = best->join_rel_list;
+ 	root->join_rel_hash = best->join_rel_hash;
++	if (refine)
++	{
++		RelOptInfo *refined;
++		List	   *saved_paths = result->pathlist;
++		List	   *saved_partial_paths = result->partial_pathlist;
++
++		root->join_rel_list = list_copy(base_list);
++		root->join_rel_hash = NULL;
++		refined = lindp_join_search(root, levels_needed, initial_rels,
++									best->order_rels);
++		if (refined == NULL)
++			elog(ERROR, "GOO %s seed has no complete LinDP plan",
++				 goo_strategy_name(best->strategy));
++		result->pathlist = NIL;
++		result->partial_pathlist = NIL;
++		goo_add_candidate_paths(root, result, refined, true);
++		goo_restore_seed_paths(result, saved_paths, saved_partial_paths);
++		root->join_rel_list = best->join_rel_list;
++		root->join_rel_hash = best->join_rel_hash;
++	}
+ 
+ 	return result;
+ }
+ 
+ /* Keep each candidate's subplans, but expose its paths on one final joinrel. */
++static void
++goo_add_candidate_paths(PlannerInfo *root, RelOptInfo *target,
++						RelOptInfo *source, bool preserve)
++{
++	ListCell   *lc;
++
++	Assert(bms_equal(target->relids, source->relids));
++
++	foreach(lc, source->pathlist)
++	{
++		Path	   *path = lfirst(lc);
++
++		/* create_projection_path cannot stack on another ProjectionPath. */
++		if (IsA(path, ProjectionPath))
++			path = ((ProjectionPath *) path)->subpath;
++		path = (Path *) create_projection_path(root, target,
++											   path, target->reltarget);
++		if (preserve)
++			target->pathlist = lappend(target->pathlist, path);
++		else
++			add_path(target, path);
++	}
++
++	foreach(lc, source->partial_pathlist)
++	{
++		Path	   *path = lfirst(lc);
++
++		if (IsA(path, ProjectionPath))
++			path = ((ProjectionPath *) path)->subpath;
++		path = (Path *) create_projection_path(root, target,
++											   path, target->reltarget);
++		if (preserve)
++			target->partial_pathlist = lappend(target->partial_pathlist, path);
++		else
++			add_partial_path(target, path);
++	}
++}
++
++static void
++goo_restore_seed_paths(RelOptInfo *target, List *seed_paths,
++					   List *seed_partial_paths)
++{
++	target->pathlist = list_concat(target->pathlist, seed_paths);
++	list_sort(target->pathlist, goo_path_total_cost_compare);
++	target->partial_pathlist =
++		list_concat(target->partial_pathlist, seed_partial_paths);
++	list_sort(target->partial_pathlist, goo_path_total_cost_compare);
++	set_cheapest(target);
++}
++
++static int
++goo_path_total_cost_compare(const ListCell *a, const ListCell *b)
++{
++	return compare_path_costs(lfirst(a), lfirst(b), TOTAL_COST);
++}
+ 
+ /*
+  * goo_init_state
+diff --git a/src/backend/optimizer/path/lindp.c b/src/backend/optimizer/path/lindp.c
+new file mode 100644
+index 00000000000..80a82e81691
+--- /dev/null
++++ b/src/backend/optimizer/path/lindp.c
+@@ -0,0 +1,252 @@
++/*-------------------------------------------------------------------------
++ *
++ * lindp.c
++ *	  Linearized dynamic programming join search for large join problems
++ *
++ * This experimental join search implementation runs dynamic programming over
++ * contiguous intervals of one relation order.  It deliberately
++ * delegates join legality and path generation to the normal PostgreSQL
++ * machinery by calling make_join_rel().
++ *
++ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/backend/optimizer/path/lindp.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "lib/stringinfo.h"
++#include "miscadmin.h"
++#include "nodes/bitmapset.h"
++#include "optimizer/joininfo.h"
++#include "optimizer/lindp.h"
++#include "optimizer/pathnode.h"
++#include "optimizer/paths.h"
++
++
++typedef struct LinDPCell
++{
++	RelOptInfo *rel;
++} LinDPCell;
++
++typedef struct LinDPOrder
++{
++	const char *name;
++	RelOptInfo **rels;
++	int			nrels;
++} LinDPOrder;
++
++static RelOptInfo *lindp_run_order(PlannerInfo *root, int levels_needed,
++								   List *initial_rels, LinDPOrder *order);
++static bool lindp_split_worth_trying(PlannerInfo *root, RelOptInfo *left,
++									 RelOptInfo *right, bool allow_clauseless);
++static void lindp_finalize_level(PlannerInfo *root, int level);
++static void lindp_debug_order(LinDPOrder *order);
++
++RelOptInfo *
++lindp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels,
++				  RelOptInfo **order_rels)
++{
++	LinDPOrder	order;
++	RelOptInfo *result;
++
++	Assert(levels_needed == list_length(initial_rels));
++	Assert(root->join_rel_level == NULL);
++
++	order.name = "goo_combined";
++	order.rels = order_rels;
++	order.nrels = levels_needed;
++
++	lindp_debug_order(&order);
++	result = lindp_run_order(root, levels_needed, initial_rels, &order);
++
++	if (result != NULL)
++		elog(DEBUG2, "LinDP goo_combined seed completed (cost: %.2f disabled_nodes: %d)",
++			 result->cheapest_total_path->total_cost,
++			 result->cheapest_total_path->disabled_nodes);
++
++	return result;
++}
++
++static RelOptInfo *
++lindp_run_order(PlannerInfo *root, int levels_needed,
++				List *initial_rels, LinDPOrder *order)
++{
++	LinDPCell  *cells;
++	RelOptInfo *result;
++	int			saved_level = root->join_cur_level;
++
++	Assert(levels_needed == order->nrels);
++	Assert(root->join_rel_level == NULL);
++
++	cells = palloc0_array(LinDPCell, (Size) order->nrels * order->nrels);
++
++#define LINDP_CELL(i, j) cells[(i) * order->nrels + (j)]
++
++	root->join_rel_level =
++		(List **) palloc0((levels_needed + 1) * sizeof(List *));
++	root->join_rel_level[1] = initial_rels;
++
++	for (int i = 0; i < order->nrels; i++)
++		LINDP_CELL(i, i).rel = order->rels[i];
++
++	for (int len = 2; len <= levels_needed; len++)
++	{
++		CHECK_FOR_INTERRUPTS();
++
++		root->join_cur_level = len;
++
++		for (int start = 0; start + len <= levels_needed; start++)
++		{
++			int			end = start + len - 1;
++
++			CHECK_FOR_INTERRUPTS();
++
++			for (int pass = 0; pass < 2; pass++)
++			{
++				bool		allow_clauseless = (pass == 1);
++
++				for (int split = start; split < end; split++)
++				{
++					RelOptInfo *left = LINDP_CELL(start, split).rel;
++					RelOptInfo *right = LINDP_CELL(split + 1, end).rel;
++					RelOptInfo *joinrel;
++
++					if (left == NULL || right == NULL)
++						continue;
++
++					if (!lindp_split_worth_trying(root, left, right,
++												  allow_clauseless))
++						continue;
++
++					joinrel = make_join_rel(root, left, right);
++					if (joinrel == NULL)
++						continue;
++
++					LINDP_CELL(start, end).rel = joinrel;
++				}
++
++				if (LINDP_CELL(start, end).rel != NULL)
++					break;
++			}
++		}
++
++		lindp_finalize_level(root, len);
++
++		for (int start = 0; start + len <= levels_needed; start++)
++		{
++			int			end = start + len - 1;
++			RelOptInfo *rel = LINDP_CELL(start, end).rel;
++
++			if (rel != NULL && rel->cheapest_total_path == NULL)
++				LINDP_CELL(start, end).rel = NULL;
++		}
++	}
++
++	result = LINDP_CELL(0, levels_needed - 1).rel;
++
++	pfree(root->join_rel_level);
++	root->join_rel_level = NULL;
++	root->join_cur_level = saved_level;
++
++	if (result != NULL && result->cheapest_total_path == NULL)
++		result = NULL;
++
++#undef LINDP_CELL
++
++	pfree(cells);
++
++	return result;
++}
++
++static bool
++lindp_split_worth_trying(PlannerInfo *root, RelOptInfo *left,
++						 RelOptInfo *right, bool allow_clauseless)
++{
++	if (have_relevant_joinclause(root, left, right) ||
++		have_join_order_restriction(root, left, right))
++		return true;
++
++	return allow_clauseless;
++}
++
++/*
++ * lindp_finalize_level
++ *		Finish path generation for all joinrels first created at this level.
++ */
++static void
++lindp_finalize_level(PlannerInfo *root, int level)
++{
++	ListCell   *lc;
++
++	foreach(lc, root->join_rel_level[level])
++	{
++		RelOptInfo *rel = lfirst_node(RelOptInfo, lc);
++		bool		is_top_rel;
++
++		is_top_rel = bms_equal(rel->relids, root->all_query_rels);
++
++		generate_partitionwise_join_paths(root, rel);
++		if (!is_top_rel)
++			generate_useful_gather_paths(root, rel, false);
++
++		if (rel->pathlist == NIL)
++			continue;
++
++		set_cheapest(rel);
++
++		if (rel->grouped_rel != NULL && !is_top_rel)
++		{
++			RelOptInfo *grouped_rel = rel->grouped_rel;
++
++			Assert(IS_GROUPED_REL(grouped_rel));
++
++			generate_grouped_paths(root, grouped_rel, rel);
++			if (grouped_rel->pathlist != NIL)
++				set_cheapest(grouped_rel);
++		}
++	}
++}
++
++/*
++ * lindp_debug_order
++ *		Emit the chosen linearization for development-time inspection.
++ */
++static void
++lindp_debug_order(LinDPOrder *order)
++{
++	StringInfoData buf;
++
++	if (!message_level_is_interesting(DEBUG1))
++		return;
++
++	initStringInfo(&buf);
++
++	for (int i = 0; i < order->nrels; i++)
++	{
++		RelOptInfo *rel = order->rels[i];
++		bool		first = true;
++		int			relid = -1;
++
++		if (i > 0)
++			appendStringInfoChar(&buf, ' ');
++
++		appendStringInfoChar(&buf, '{');
++		while ((relid = bms_next_member(rel->relids, relid)) >= 0)
++		{
++			if (!first)
++				appendStringInfoChar(&buf, ',');
++			appendStringInfo(&buf, "%d", relid);
++			first = false;
++		}
++		appendStringInfoChar(&buf, '}');
++	}
++
++	elog(DEBUG1, "LinDP %s join order: %s", order->name, buf.data);
++
++	pfree(buf.data);
++}
+diff --git a/src/backend/optimizer/path/meson.build b/src/backend/optimizer/path/meson.build
+index d4e71a23396..437f7a0b4ad 100644
+--- a/src/backend/optimizer/path/meson.build
++++ b/src/backend/optimizer/path/meson.build
+@@ -7,6 +7,7 @@ backend_sources += files(
+   'equivclass.c',
+   'goo.c',
+   'indxpath.c',
++  'lindp.c',
+   'joinpath.c',
+   'joinrels.c',
+   'pathkeys.c',
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 6b44aeeeb14..8b78e46def2 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -430,6 +430,7 @@ static const struct config_enum_entry join_search_method_options[] = {
+ 	{"dp", JOIN_SEARCH_DP, false},
+ 	{"geqo", JOIN_SEARCH_GEQO, false},
+ 	{"goo_combined", JOIN_SEARCH_GOO_COMBINED, false},
++	{"goo_lindp", JOIN_SEARCH_GOO_LINDP, false},
+ 	{NULL, 0, false}
+ };
+ 
+diff --git a/src/include/optimizer/goo.h b/src/include/optimizer/goo.h
+index 46ac8d77c50..2ae19609a0b 100644
+--- a/src/include/optimizer/goo.h
++++ b/src/include/optimizer/goo.h
+@@ -8,7 +8,8 @@ typedef enum JoinSearchMethod
+ 	JOIN_SEARCH_AUTO,
+ 	JOIN_SEARCH_DP,
+ 	JOIN_SEARCH_GEQO,
+-	JOIN_SEARCH_GOO_COMBINED
++	JOIN_SEARCH_GOO_COMBINED,
++	JOIN_SEARCH_GOO_LINDP
+ } JoinSearchMethod;
+ 
+ typedef enum GooGreedyStrategy
+diff --git a/src/include/optimizer/lindp.h b/src/include/optimizer/lindp.h
+new file mode 100644
+index 00000000000..4f65e8c6215
+--- /dev/null
++++ b/src/include/optimizer/lindp.h
+@@ -0,0 +1,9 @@
++#ifndef LINDP_H
++#define LINDP_H
++
++#include "nodes/pathnodes.h"
++
++extern RelOptInfo *lindp_join_search(PlannerInfo *root, int levels_needed,
++									 List *initial_rels, RelOptInfo **order_rels);
++
++#endif
+diff --git a/src/test/regress/expected/join_search.out b/src/test/regress/expected/join_search.out
+index 8ec67de0d97..99518157440 100644
+--- a/src/test/regress/expected/join_search.out
++++ b/src/test/regress/expected/join_search.out
+@@ -28,13 +28,13 @@ BEGIN
+     RETURN matches;
+ END;
+ $$;
+-SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined');
+- js_check | js_check | js_check 
+-----------+----------+----------
+- t        | t        | t
++SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp');
++ js_check | js_check | js_check | js_check 
++----------+----------+----------+----------
++ t        | t        | t        | t
+ (1 row)
+ 
+-SET join_search_method = goo_combined;
++SET join_search_method = goo_lindp;
+ SELECT count(*) FROM js_a, js_b, js_c;
+  count 
+ -------
+@@ -50,7 +50,7 @@ JOIN js_c c ON c.a = a.a;
+ 
+ SET join_search_method = invalid;
+ ERROR:  invalid value for parameter "join_search_method": "invalid"
+-HINT:  Available values: auto, dp, geqo, goo_combined.
++HINT:  Available values: auto, dp, geqo, goo_combined, goo_lindp.
+ RESET join_search_method;
+ DROP FUNCTION js_check(text);
+ DROP TABLE js_expected, js_a, js_b, js_c;
+diff --git a/src/test/regress/sql/join_search.sql b/src/test/regress/sql/join_search.sql
+index 6f18e13d3a7..8b3533dcf1f 100644
+--- a/src/test/regress/sql/join_search.sql
++++ b/src/test/regress/sql/join_search.sql
+@@ -28,8 +28,8 @@ BEGIN
+     RETURN matches;
+ END;
+ $$;
+-SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined');
+-SET join_search_method = goo_combined;
++SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp');
++SET join_search_method = goo_lindp;
+ SELECT count(*) FROM js_a, js_b, js_c;
+ SELECT count(*) FROM js_a a LEFT JOIN js_b b ON a.a = b.a
+ JOIN js_c c ON c.a = a.a;
+-- 
+2.50.1 (Apple Git-155)
+

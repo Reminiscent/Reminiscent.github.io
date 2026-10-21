@@ -1,0 +1,259 @@
+From dc3818380eedd5d6714b0588c357f257877dc2c5 Mon Sep 17 00:00:00 2001
+From: Synthetic Benchmark Review <review@example.invalid>
+Date: Sat, 17 Oct 2026 14:48:04 +0800
+Subject: [PATCH 4/7] Compose rollout with one-pass LinDP refinement
+
+Refine the best completed rollout order once and retain ordinary GOO,
+rollout, and LinDP paths for final selection. Keep orchestration in
+one entry point without multi-round or multi-order experiment modes.
+
+Exercise all explicit methods and cover repeated execution, eager
+aggregation, and a failed greedy continuation without DP fallback.
+---
+ src/backend/optimizer/path/goo.c          | 37 ++++-------------
+ src/backend/utils/misc/guc_tables.c       |  1 +
+ src/include/optimizer/goo.h               |  3 +-
+ src/test/regress/expected/join_search.out | 50 ++++++++++++++++++++---
+ src/test/regress/sql/join_search.sql      | 21 +++++++++-
+ 5 files changed, 75 insertions(+), 37 deletions(-)
+
+diff --git a/src/backend/optimizer/path/goo.c b/src/backend/optimizer/path/goo.c
+index 386ce5dbf62..00c696f7419 100644
+--- a/src/backend/optimizer/path/goo.c
++++ b/src/backend/optimizer/path/goo.c
+@@ -51,9 +51,6 @@
+ #include "utils/hsearch.h"
+ #include "utils/memutils.h"
+ 
+-/*
+- * Configuration defaults.  These are exposed as GUCs in guc_tables.c.
+- */
+ 
+ typedef struct GooState
+ {
+@@ -158,7 +155,7 @@ static GooStrategyResult goo_run_strategy(PlannerInfo *root, List *initial_rels,
+ 										  bool capture_order, bool rollout);
+ 
+ static void goo_add_candidate_paths(PlannerInfo *root, RelOptInfo *target,
+-									RelOptInfo *source, bool preserve);
++									RelOptInfo *source);
+ static void goo_restore_seed_paths(RelOptInfo *target, List *seed_paths,
+ 								   List *seed_partial_paths);
+ static int	goo_path_total_cost_compare(const ListCell *a, const ListCell *b);
+@@ -189,8 +186,8 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 	GooStrategyResult seeds[lengthof(strategies)];
+ 	GooStrategyResult *best = NULL;
+ 	RelOptInfo *result;
+-	bool		refine = join_search_method == JOIN_SEARCH_GOO_LINDP;
+-	bool		rollout = join_search_method == JOIN_SEARCH_GOO_ROLLOUT;
++	bool		refine = (join_search_method == JOIN_SEARCH_GOO_LINDP || join_search_method == JOIN_SEARCH_GOO_ROLLOUT_LINDP);
++	bool		rollout = (join_search_method == JOIN_SEARCH_GOO_ROLLOUT || join_search_method == JOIN_SEARCH_GOO_ROLLOUT_LINDP);
+ 
+ 	Assert(levels_needed == list_length(initial_rels));
+ 	for (int index = 0; index < lengthof(strategies); index++)
+@@ -227,7 +224,7 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 				 goo_strategy_name(best->strategy));
+ 		result->pathlist = NIL;
+ 		result->partial_pathlist = NIL;
+-		goo_add_candidate_paths(root, result, refined, true);
++		goo_add_candidate_paths(root, result, refined);
+ 		goo_restore_seed_paths(result, saved_paths, saved_partial_paths);
+ 		root->join_rel_list = best->join_rel_list;
+ 		root->join_rel_hash = best->join_rel_hash;
+@@ -241,8 +238,8 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ 				elog(ERROR, "GOO %s rollout found no ordinary completion",
+ 					 goo_strategy_name(strategies[index]));
+ 			if (&seeds[index] != best)
+-				goo_add_candidate_paths(root, result, seeds[index].result, true);
+-			goo_add_candidate_paths(root, result, seeds[index].ordinary_result, true);
++				goo_add_candidate_paths(root, result, seeds[index].result);
++			goo_add_candidate_paths(root, result, seeds[index].ordinary_result);
+ 		}
+ 		list_sort(result->pathlist, goo_path_total_cost_compare);
+ 		list_sort(result->partial_pathlist, goo_path_total_cost_compare);
+@@ -255,7 +252,7 @@ goo_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+ /* Keep each candidate's subplans, but expose its paths on one final joinrel. */
+ static void
+ goo_add_candidate_paths(PlannerInfo *root, RelOptInfo *target,
+-						RelOptInfo *source, bool preserve)
++						RelOptInfo *source)
+ {
+ 	ListCell   *lc;
+ 
+@@ -270,10 +267,7 @@ goo_add_candidate_paths(PlannerInfo *root, RelOptInfo *target,
+ 			path = ((ProjectionPath *) path)->subpath;
+ 		path = (Path *) create_projection_path(root, target,
+ 											   path, target->reltarget);
+-		if (preserve)
+-			target->pathlist = lappend(target->pathlist, path);
+-		else
+-			add_path(target, path);
++		target->pathlist = lappend(target->pathlist, path);
+ 	}
+ 
+ 	foreach(lc, source->partial_pathlist)
+@@ -284,10 +278,7 @@ goo_add_candidate_paths(PlannerInfo *root, RelOptInfo *target,
+ 			path = ((ProjectionPath *) path)->subpath;
+ 		path = (Path *) create_projection_path(root, target,
+ 											   path, target->reltarget);
+-		if (preserve)
+-			target->partial_pathlist = lappend(target->partial_pathlist, path);
+-		else
+-			add_partial_path(target, path);
++		target->partial_pathlist = lappend(target->partial_pathlist, path);
+ 	}
+ }
+ 
+@@ -511,16 +502,6 @@ goo_strategy_result_better(GooStrategyResult *candidate,
+ 	return candidate->total_cost < best->total_cost;
+ }
+ 
+-/*
+- * goo_run_combined
+- *		Run the requested GOO strategies against the same base joinrel
+- *		containers and return the best completed result.
+- *
+- * goo_run_strategy() restores the containers after each component.  Other
+- * planner objects can still retain costing caches, so this is deliberately
+- * the definition of one GOO combined search, not an independent multi-start
+- * contract.
+- */
+ 
+ static GooStrategyResult
+ goo_run_strategy(PlannerInfo *root, List *initial_rels,
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index ba67600a4cc..90bbf4d4998 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -432,6 +432,7 @@ static const struct config_enum_entry join_search_method_options[] = {
+ 	{"goo_combined", JOIN_SEARCH_GOO_COMBINED, false},
+ 	{"goo_lindp", JOIN_SEARCH_GOO_LINDP, false},
+ 	{"goo_rollout", JOIN_SEARCH_GOO_ROLLOUT, false},
++	{"goo_rollout_lindp", JOIN_SEARCH_GOO_ROLLOUT_LINDP, false},
+ 	{NULL, 0, false}
+ };
+ 
+diff --git a/src/include/optimizer/goo.h b/src/include/optimizer/goo.h
+index 87c2b3cebff..6d3de29a72b 100644
+--- a/src/include/optimizer/goo.h
++++ b/src/include/optimizer/goo.h
+@@ -10,7 +10,8 @@ typedef enum JoinSearchMethod
+ 	JOIN_SEARCH_GEQO,
+ 	JOIN_SEARCH_GOO_COMBINED,
+ 	JOIN_SEARCH_GOO_LINDP,
+-	JOIN_SEARCH_GOO_ROLLOUT
++	JOIN_SEARCH_GOO_ROLLOUT,
++	JOIN_SEARCH_GOO_ROLLOUT_LINDP
+ } JoinSearchMethod;
+ 
+ typedef enum GooGreedyStrategy
+diff --git a/src/test/regress/expected/join_search.out b/src/test/regress/expected/join_search.out
+index e1e23f079a9..e53fa4a2867 100644
+--- a/src/test/regress/expected/join_search.out
++++ b/src/test/regress/expected/join_search.out
+@@ -28,13 +28,13 @@ BEGIN
+     RETURN matches;
+ END;
+ $$;
+-SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout');
+- js_check | js_check | js_check | js_check | js_check 
+-----------+----------+----------+----------+----------
+- t        | t        | t        | t        | t
++SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout'), js_check('goo_rollout_lindp');
++ js_check | js_check | js_check | js_check | js_check | js_check 
++----------+----------+----------+----------+----------+----------
++ t        | t        | t        | t        | t        | t
+ (1 row)
+ 
+-SET join_search_method = goo_rollout;
++SET join_search_method = goo_rollout_lindp;
+ SELECT count(*) FROM js_a, js_b, js_c;
+  count 
+ -------
+@@ -48,9 +48,47 @@ JOIN js_c c ON c.a = a.a;
+      3
+ (1 row)
+ 
++PREPARE js_repeat AS SELECT c.b, a.b, b.a
++FROM js_a a JOIN js_b b ON a.a = b.a JOIN js_c c ON c.a = b.a
++ORDER BY c.b, a.b, b.a;
++EXECUTE js_repeat;
++  b   | b  | a 
++------+----+---
++ 1000 | 10 | 1
++ 1000 | 20 | 1
++ 2000 | 30 | 2
++(3 rows)
++
++EXECUTE js_repeat;
++  b   | b  | a 
++------+----+---
++ 1000 | 10 | 1
++ 1000 | 20 | 1
++ 2000 | 30 | 2
++(3 rows)
++
++DEALLOCATE js_repeat;
++SET enable_eager_aggregate = on;
++SET min_eager_agg_group_size = 0;
++SELECT a.a, count(*) FROM js_a a JOIN js_b b ON a.a = b.a
++JOIN js_c c ON c.a = b.a GROUP BY a.a ORDER BY a.a;
++ a | count 
++---+-------
++ 1 |     2
++ 2 |     1
++(2 rows)
++
++RESET min_eager_agg_group_size;
++RESET enable_eager_aggregate;
++SELECT count(*)
++FROM js_b b, js_c c,
++LATERAL (SELECT js_a.a, js_a.b FROM js_a WHERE js_a.b = c.a OFFSET 0) a,
++LATERAL (SELECT js_a.a, js_a.b FROM js_a WHERE js_a.b = b.a OFFSET 0) d
++WHERE a.a = b.a AND c.a = d.a;
++ERROR:  GOO RESULT_SIZE search found no complete plan
+ SET join_search_method = invalid;
+ ERROR:  invalid value for parameter "join_search_method": "invalid"
+-HINT:  Available values: auto, dp, geqo, goo_combined, goo_lindp, goo_rollout.
++HINT:  Available values: auto, dp, geqo, goo_combined, goo_lindp, goo_rollout, goo_rollout_lindp.
+ RESET join_search_method;
+ DROP FUNCTION js_check(text);
+ DROP TABLE js_expected, js_a, js_b, js_c;
+diff --git a/src/test/regress/sql/join_search.sql b/src/test/regress/sql/join_search.sql
+index 18f48048c94..78ba8add3ca 100644
+--- a/src/test/regress/sql/join_search.sql
++++ b/src/test/regress/sql/join_search.sql
+@@ -28,11 +28,28 @@ BEGIN
+     RETURN matches;
+ END;
+ $$;
+-SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout');
+-SET join_search_method = goo_rollout;
++SELECT js_check('dp'), js_check('geqo'), js_check('goo_combined'), js_check('goo_lindp'), js_check('goo_rollout'), js_check('goo_rollout_lindp');
++SET join_search_method = goo_rollout_lindp;
+ SELECT count(*) FROM js_a, js_b, js_c;
+ SELECT count(*) FROM js_a a LEFT JOIN js_b b ON a.a = b.a
+ JOIN js_c c ON c.a = a.a;
++PREPARE js_repeat AS SELECT c.b, a.b, b.a
++FROM js_a a JOIN js_b b ON a.a = b.a JOIN js_c c ON c.a = b.a
++ORDER BY c.b, a.b, b.a;
++EXECUTE js_repeat;
++EXECUTE js_repeat;
++DEALLOCATE js_repeat;
++SET enable_eager_aggregate = on;
++SET min_eager_agg_group_size = 0;
++SELECT a.a, count(*) FROM js_a a JOIN js_b b ON a.a = b.a
++JOIN js_c c ON c.a = b.a GROUP BY a.a ORDER BY a.a;
++RESET min_eager_agg_group_size;
++RESET enable_eager_aggregate;
++SELECT count(*)
++FROM js_b b, js_c c,
++LATERAL (SELECT js_a.a, js_a.b FROM js_a WHERE js_a.b = c.a OFFSET 0) a,
++LATERAL (SELECT js_a.a, js_a.b FROM js_a WHERE js_a.b = b.a OFFSET 0) d
++WHERE a.a = b.a AND c.a = d.a;
+ SET join_search_method = invalid;
+ RESET join_search_method;
+ DROP FUNCTION js_check(text);
+-- 
+2.50.1 (Apple Git-155)
+
